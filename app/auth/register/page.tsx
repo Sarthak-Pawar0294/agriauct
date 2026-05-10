@@ -17,11 +17,13 @@ import {
 } from "@/components/ui/select"
 import { useAuth } from "@/lib/auth-context"
 import { type UserRole, indianStates, indianStateDistricts } from "@/lib/mock-data"
+import { useSubmit } from "@/hooks/useSubmit"
 
 function RegisterForm() {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const { register, isLoading } = useAuth()
+  const { register } = useAuth()
+  const { isSubmitting, execute } = useSubmit()
   const [showPassword, setShowPassword] = useState(false)
   const [formData, setFormData] = useState({
     fullName: "",
@@ -58,14 +60,15 @@ function RegisterForm() {
       return
     }
 
-    const result = await register(formData)
-
-    if (result.success) {
-      toast.success("Account created successfully!")
-      router.push(formData.role === "farmer" ? "/farmer/dashboard" : "/vendor/dashboard")
-    } else {
-      toast.error(result.error || "Registration failed")
-    }
+    await execute(async () => {
+      const result = await register(formData)
+      if (result.success) {
+        toast.success("Account created successfully!")
+        router.push(formData.role === "farmer" ? "/farmer/dashboard" : "/vendor/dashboard")
+      } else {
+        toast.error(result.error || "Registration failed")
+      }
+    })
   }
 
   return (
@@ -209,8 +212,8 @@ function RegisterForm() {
         </Select>
       </div>
 
-      <Button type="submit" className="w-full" disabled={isLoading}>
-        {isLoading ? "Creating account..." : "Create Account"}
+      <Button type="submit" className="w-full" disabled={isSubmitting}>
+        {isSubmitting ? "Creating account..." : "Create Account"}
       </Button>
     </form>
   )

@@ -9,10 +9,12 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/lib/auth-context"
+import { useSubmit } from "@/hooks/useSubmit"
 
 export default function LoginPage() {
   const router = useRouter()
-  const { login, isLoading } = useAuth()
+  const { login } = useAuth()
+  const { isSubmitting, execute } = useSubmit()
   const [showPassword, setShowPassword] = useState(false)
   const [formData, setFormData] = useState({
     email: "",
@@ -21,31 +23,27 @@ export default function LoginPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    
-    const result = await login(formData.email, formData.password)
-    
-    if (result.success) {
-      toast.success("Welcome back!")
-      // The auth context will have the user, redirect based on role
-      // For demo, we'll check the email to determine role
-      if (formData.email.includes("rajesh") || formData.email.includes("priya")) {
-        router.push("/farmer/dashboard")
+    await execute(async () => {
+      const result = await login(formData.email, formData.password)
+      if (result.success) {
+        toast.success("Welcome back!")
+        router.push(result.role === "farmer" ? "/farmer/dashboard" : "/vendor/dashboard")
       } else {
-        router.push("/vendor/dashboard")
+        toast.error(result.error || "Login failed")
       }
-    } else {
-      toast.error(result.error || "Login failed")
-    }
+    })
   }
 
   // Demo quick login buttons
   const quickLogin = async (email: string, role: "farmer" | "vendor") => {
     setFormData({ email, password: "demo123" })
-    const result = await login(email, "demo123")
-    if (result.success) {
-      toast.success("Welcome back!")
-      router.push(role === "farmer" ? "/farmer/dashboard" : "/vendor/dashboard")
-    }
+    await execute(async () => {
+      const result = await login(email, "demo123")
+      if (result.success) {
+        toast.success("Welcome back!")
+        router.push(role === "farmer" ? "/farmer/dashboard" : "/vendor/dashboard")
+      }
+    })
   }
 
   return (
@@ -104,8 +102,8 @@ export default function LoginPage() {
                 </div>
               </div>
 
-              <Button type="submit" className="w-full" disabled={isLoading}>
-                {isLoading ? "Signing in..." : "Sign In"}
+              <Button type="submit" className="w-full" disabled={isSubmitting}>
+                {isSubmitting ? "Signing in..." : "Sign In"}
               </Button>
             </form>
 
@@ -125,7 +123,7 @@ export default function LoginPage() {
                   variant="outline"
                   size="sm"
                   onClick={() => quickLogin("rajesh@example.com", "farmer")}
-                  disabled={isLoading}
+                  disabled={isSubmitting}
                 >
                   Farmer Demo
                 </Button>
@@ -134,7 +132,7 @@ export default function LoginPage() {
                   variant="outline"
                   size="sm"
                   onClick={() => quickLogin("amit@example.com", "vendor")}
-                  disabled={isLoading}
+                  disabled={isSubmitting}
                 >
                   Vendor Demo
                 </Button>

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect } from "react"
 import { use } from "react"
 import Link from "next/link"
 import Image from "next/image"
@@ -13,6 +13,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useAuth } from "@/lib/auth-context"
+import { useSubmit } from "@/hooks/useSubmit"
 import {
   formatCurrency,
   formatTimeRemaining,
@@ -32,7 +33,7 @@ export default function AuctionDetailPage({
   const { user } = useAuth()
   const [, setTick] = useState(0)
   const [bidAmount, setBidAmount] = useState("")
-  const [isPlacingBid, setIsPlacingBid] = useState(false)
+  const { isSubmitting: isPlacingBid, execute } = useSubmit()
   const [localBids, setLocalBids] = useState<Bid[]>([])
   const [currentHighestBid, setCurrentHighestBid] = useState(0)
   const [listing, setListing] = useState<Listing | null>(null)
@@ -178,7 +179,7 @@ export default function AuctionDetailPage({
     }
   }, [listing])
 
-  const handlePlaceBid = useCallback(async () => {
+  const handlePlaceBid = async () => {
     if (!listing) return
     if (!user) {
       toast.error("Please login to place a bid")
@@ -196,38 +197,32 @@ export default function AuctionDetailPage({
       return
     }
 
-    setIsPlacingBid(true)
-
-    const { data, error } = await supabase
-      .from("bids")
-      .insert({
-        listing_id: listing.id,
-        vendor_id: user.id,
-        vendor_name: user.fullName,
-        amount,
+    await execute(async () => {
+      // Call the atomic place_bid RPC — this validates the bid
+      // amount against the *actual* database value and locks the
+      // row to prevent race conditions between concurrent bidders.
+      const { data, error } = await supabase.rpc("place_bid", {
+        p_listing_id: listing.id,
+        p_vendor_id: user.id,
+        p_vendor_name: user.fullName,
+        p_amount: amount,
       })
-      .select()
-      .single()
 
-    if (error || !data) {
-      toast.error(error?.message || "Failed to place bid")
-      setIsPlacingBid(false)
-      return
-    }
+      if (error) {
+        console.error("place_bid RPC error:", error)
+        throw new Error(error.message || "Failed to place bid. Please try again.")
+      }
 
-    // Optimistically update listing summary
-    await supabase
-      .from("listings")
-      .update({
-        current_highest_bid: amount,
-        bid_count: (listing.bidCount ?? 0) + 1,
-      })
-      .eq("id", listing.id)
+      // The RPC returns { success, error?, bid_id? }
+      if (!data.success) {
+        toast.error(data.error || "Failed to place bid")
+        return
+      }
 
-    setBidAmount("")
-    setIsPlacingBid(false)
-    toast.success("Bid placed successfully!")
-  }, [user, bidAmount, currentHighestBid, listing])
+      setBidAmount("")
+      toast.success("Bid placed successfully!")
+    })
+  }
 
   if (isLoading) {
     return (

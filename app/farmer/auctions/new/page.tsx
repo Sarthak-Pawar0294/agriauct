@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { useRouter } from "next/navigation"
 import Link from "next/link"
 import { ArrowLeft, Upload, X } from "lucide-react"
@@ -20,14 +20,22 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { DashboardLayout } from "@/components/dashboard-layout"
 import { useAuth } from "@/lib/auth-context"
 import { supabase } from "@/lib/supabase"
+import { useSubmit } from "@/hooks/useSubmit"
 import { categories, qualityGrades, indianStates, type Category, type QualityGrade } from "@/lib/mock-data"
 
 export default function CreateAuctionPage() {
   const router = useRouter()
   const { user } = useAuth()
-  const [isSubmitting, setIsSubmitting] = useState(false)
+  const { isSubmitting, execute } = useSubmit()
+  const [isMounted, setIsMounted] = useState(false)
+
+  useEffect(() => { setIsMounted(true) }, [])
+
   const [imagePreview, setImagePreview] = useState<string | null>(null)
   const [imageFile, setImageFile] = useState<File | null>(null)
+  const [imageUrlInput, setImageUrlInput] = useState("")
+  const [startTime, setStartTime] = useState("")
+  const [endTime, setEndTime] = useState("")
   const [formData, setFormData] = useState({
     cropName: "",
     category: "" as Category | "",
@@ -36,7 +44,6 @@ export default function CreateAuctionPage() {
     state: "",
     district: "",
     startingPrice: "",
-    auctionDuration: "24",
     description: "",
   })
 
@@ -55,6 +62,7 @@ export default function CreateAuctionPage() {
   const removeImage = () => {
     setImagePreview(null)
     setImageFile(null)
+    setImageUrlInput("")
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -64,31 +72,76 @@ export default function CreateAuctionPage() {
       return
     }
 
-    setIsSubmitting(true)
+    const hasFile = !!imageFile
+    const hasUrl = imageUrlInput.trim() !== ""
 
-    try {
+    // Image validation
+    if (!hasFile && !hasUrl) {
+      toast.error("Please upload an image file or paste an image URL.")
+      return
+    }
+    if (hasFile && hasUrl) {
+      toast.error("Please provide either an image file or a URL — not both.")
+      return
+    }
+
+    // Time validation
+    if (!startTime) {
+      toast.error("Please set a Start Time for the auction.")
+      return
+    }
+    if (!endTime) {
+      toast.error("Please set an End Time for the auction.")
+      return
+    }
+
+    const startMs = new Date(startTime).getTime()
+    const endMs   = new Date(endTime).getTime()
+    const nowMs   = Date.now()
+
+    // Allow up to 60 seconds in the past to account for the time
+    // a farmer spends filling in the rest of the form.
+    if (startMs < nowMs - 60_000) {
+      toast.error("Start Time cannot be in the past.")
+      return
+    }
+    if (endMs <= startMs) {
+      toast.error("End Time must be after Start Time.")
+      return
+    }
+
+    await execute(async () => {
       let imageUrl: string | null = null
 
-      if (imageFile) {
-        const filePath = `${user.id}/${Date.now()}-${imageFile.name}`
+      if (hasFile) {
+        // Upload physical file to Supabase Storage
+        const filePath = `${user.id}/${Date.now()}-${imageFile!.name}`
         const { error: uploadError } = await supabase.storage
           .from("produce-images")
-          .upload(filePath, imageFile)
+          .upload(filePath, imageFile!)
 
         if (uploadError) {
-          throw uploadError
+          console.error("Storage upload error:", uploadError)
+          throw new Error(uploadError.message || "Failed to upload image. Please try again.")
         }
 
         const { data: publicUrlData } = supabase.storage
           .from("produce-images")
           .getPublicUrl(filePath)
 
+        if (!publicUrlData?.publicUrl) {
+          throw new Error("Could not get a public URL for the uploaded image.")
+        }
+
         imageUrl = publicUrlData.publicUrl
+      } else {
+        // Use the pasted external URL directly — no storage upload needed
+        imageUrl = imageUrlInput.trim()
       }
 
-      const now = new Date()
-      const durationHours = Number(formData.auctionDuration || "24")
-      const endTime = new Date(now.getTime() + durationHours * 60 * 60 * 1000)
+      const startDate     = new Date(startTime)
+      const endDate       = new Date(endTime)
+      const durationHours = Math.max(1, Math.round((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60)))
 
       const { error: insertError } = await supabase.from("listings").insert({
         farmer_id: user.id,
@@ -102,25 +155,41 @@ export default function CreateAuctionPage() {
         starting_price: Number(formData.startingPrice),
         current_highest_bid: Number(formData.startingPrice),
         auction_duration: durationHours,
-        start_time: now.toISOString(),
-        end_time: endTime.toISOString(),
+        start_time: startDate.toISOString(),
+        end_time:   endDate.toISOString(),
         status: "active",
         image_url: imageUrl,
         bid_count: 0,
       })
 
       if (insertError) {
-        throw insertError
+        console.error("Listing insert error:", insertError)
+        throw new Error(insertError.message || "Failed to create auction listing. Please try again.")
       }
+
+      // Reset all form state on success
+      setFormData({
+        cropName: "",
+        category: "" as Category | "",
+        quantity: "",
+        qualityGrade: "" as QualityGrade | "",
+        state: "",
+        district: "",
+        startingPrice: "",
+        description: "",
+      })
+      setStartTime("")
+      setEndTime("")
+      setImageFile(null)
+      setImagePreview(null)
+      setImageUrlInput("")
 
       toast.success("Auction created successfully!")
       router.push("/farmer/dashboard")
-    } catch (error: any) {
-      console.error("Failed to create auction", error)
-      toast.error(error?.message || "Failed to create auction")
-      setIsSubmitting(false)
-    }
+    })
   }
+
+  if (!isMounted) return null
 
   return (
     <DashboardLayout role="farmer">
@@ -142,8 +211,10 @@ export default function CreateAuctionPage() {
           <CardContent>
             <form onSubmit={handleSubmit} className="space-y-6">
               {/* Image Upload */}
-              <div className="space-y-2">
-                <Label>Produce Image</Label>
+              <div className="space-y-3">
+                <Label>Produce Image <span className="text-destructive">*</span></Label>
+
+                {/* Drag-and-drop file upload */}
                 {imagePreview ? (
                   <div className="relative">
                     <img
@@ -160,7 +231,13 @@ export default function CreateAuctionPage() {
                     </button>
                   </div>
                 ) : (
-                  <label className="flex h-48 cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-border bg-muted/30 hover:bg-muted/50">
+                  <label
+                    className={`flex h-48 cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed bg-muted/30 hover:bg-muted/50 transition-colors ${
+                      imageUrlInput.trim()
+                        ? "border-border opacity-40 pointer-events-none"
+                        : "border-border"
+                    }`}
+                  >
                     <Upload className="h-10 w-10 text-muted-foreground" />
                     <span className="mt-2 text-sm text-muted-foreground">
                       Click to upload image
@@ -170,9 +247,38 @@ export default function CreateAuctionPage() {
                       accept="image/*"
                       className="hidden"
                       onChange={handleImageChange}
+                      disabled={!!imageUrlInput.trim()}
                     />
                   </label>
                 )}
+
+                {/* Divider */}
+                <div className="flex items-center gap-3">
+                  <div className="h-px flex-1 bg-border" />
+                  <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">or</span>
+                  <div className="h-px flex-1 bg-border" />
+                </div>
+
+                {/* External URL input */}
+                <div className="space-y-1">
+                  <Label htmlFor="imageUrlInput" className="text-sm font-normal text-muted-foreground">
+                    Paste an Image URL
+                  </Label>
+                  <Input
+                    id="imageUrlInput"
+                    type="url"
+                    placeholder="https://example.com/image.jpg"
+                    value={imageUrlInput}
+                    onChange={(e) => setImageUrlInput(e.target.value)}
+                    disabled={!!imageFile}
+                    className={imageFile ? "opacity-40 cursor-not-allowed" : ""}
+                  />
+                  {imageFile && (
+                    <p className="text-xs text-muted-foreground">
+                      Remove the uploaded file first to use a URL instead.
+                    </p>
+                  )}
+                </div>
               </div>
 
               {/* Crop Name */}
@@ -275,39 +381,91 @@ export default function CreateAuctionPage() {
                 </div>
               </div>
 
-              {/* Price & Duration */}
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="startingPrice">Starting Price (Rs.)</Label>
-                  <Input
-                    id="startingPrice"
-                    type="number"
-                    placeholder="Enter starting bid"
-                    value={formData.startingPrice}
-                    onChange={(e) => setFormData({ ...formData, startingPrice: e.target.value })}
-                    min="1"
-                    required
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>Auction Duration</Label>
-                  <Select
-                    value={formData.auctionDuration}
-                    onValueChange={(value) => setFormData({ ...formData, auctionDuration: value })}
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="6">6 hours</SelectItem>
-                      <SelectItem value="12">12 hours</SelectItem>
-                      <SelectItem value="24">24 hours</SelectItem>
-                      <SelectItem value="48">48 hours</SelectItem>
-                      <SelectItem value="72">72 hours</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
+              {/* Price */}
+              <div className="space-y-2">
+                <label htmlFor="startingPrice" className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">
+                  Starting Price (Rs.)
+                </label>
+                <Input
+                  id="startingPrice"
+                  type="number"
+                  placeholder="Enter starting bid"
+                  value={formData.startingPrice}
+                  onChange={(e) => setFormData({ ...formData, startingPrice: e.target.value })}
+                  min="1"
+                  required
+                />
               </div>
+
+              {/* Auction Schedule */}
+              {(() => {
+                // Compute a live duration hint whenever both fields are filled
+                const durationHint = (() => {
+                  if (!startTime || !endTime) return null
+                  const diffMs = new Date(endTime).getTime() - new Date(startTime).getTime()
+                  if (diffMs <= 0) return null
+                  const totalMins = Math.round(diffMs / 60_000)
+                  const h = Math.floor(totalMins / 60)
+                  const m = totalMins % 60
+                  return h > 0 ? `${h}h${m > 0 ? ` ${m}m` : ""}` : `${m}m`
+                })()
+
+                // Compute the min value for the datetime-local input: now rounded up to the minute
+                const nowLocal = new Date(Date.now() - new Date().getTimezoneOffset() * 60_000)
+                  .toISOString()
+                  .slice(0, 16)
+
+                return (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-medium leading-none">
+                        Auction Schedule
+                      </span>
+                      {durationHint && (
+                        <span className="text-xs font-medium text-primary bg-primary/10 rounded-full px-2.5 py-0.5">
+                          Duration: {durationHint}
+                        </span>
+                      )}
+                    </div>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="space-y-1.5">
+                        <label
+                          htmlFor="startTime"
+                          className="text-xs font-medium text-muted-foreground uppercase tracking-wide"
+                        >
+                          Start Time
+                        </label>
+                        <input
+                          id="startTime"
+                          type="datetime-local"
+                          value={startTime}
+                          onChange={(e) => setStartTime(e.target.value)}
+                          min={nowLocal}
+                          required
+                          className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 [color-scheme:auto]"
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label
+                          htmlFor="endTime"
+                          className="text-xs font-medium text-muted-foreground uppercase tracking-wide"
+                        >
+                          End Time
+                        </label>
+                        <input
+                          id="endTime"
+                          type="datetime-local"
+                          value={endTime}
+                          onChange={(e) => setEndTime(e.target.value)}
+                          min={startTime || nowLocal}
+                          required
+                          className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 [color-scheme:auto]"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )
+              })()}
 
               {/* Description */}
               <div className="space-y-2">

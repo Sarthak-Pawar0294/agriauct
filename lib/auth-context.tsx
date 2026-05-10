@@ -18,7 +18,7 @@ interface AuthUser {
 interface AuthContextType {
   user: AuthUser | null
   isLoading: boolean
-  login: (email: string, password: string) => Promise<{ success: boolean; error?: string }>
+  login: (email: string, password: string) => Promise<{ success: boolean; role?: UserRole; error?: string }>
   register: (data: RegisterData) => Promise<{ success: boolean; error?: string }>
   logout: () => Promise<void>
 }
@@ -54,51 +54,63 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null)
   const [isLoading, setIsLoading] = useState(true)
 
-  // Load current session/user on mount
+  // Load current session/user on mount.
+  // IMPORTANT: getUser() must fully complete before onAuthStateChange is
+  // registered to avoid a localStorage lock race condition that causes:
+  // "Lock was released because another request stole it"
   useEffect(() => {
     let isMounted = true
+    let subscription: { unsubscribe: () => void } | null = null
 
-    const getInitialUser = async () => {
+    const initialize = async () => {
+      // Step 1: Perform the initial user check and wait for it to finish.
       const { data, error } = await supabase.auth.getUser()
-      if (error || !data.user) {
-        if (isMounted) setIsLoading(false)
-        return
-      }
-
-      const { data: profile } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", data.user.id)
-        .single()
 
       if (isMounted) {
-        setUser(mapProfileToAuthUser(profile))
+        if (!error && data.user) {
+          const { data: profile } = await supabase
+            .from("profiles")
+            .select("*")
+            .eq("id", data.user.id)
+            .single()
+
+          if (isMounted) {
+            setUser(mapProfileToAuthUser(profile))
+          }
+        }
+        // Always clear loading state after the initial check, whether or
+        // not a user was found.
         setIsLoading(false)
+      }
+
+      // Step 2: Only NOW, after the initial check is complete, set up the
+      // listener for future auth state changes (sign-in, sign-out, etc.).
+      if (isMounted) {
+        const { data: { subscription: sub } } = supabase.auth.onAuthStateChange(
+          async (event, session) => {
+            if (!session?.user) {
+              setUser(null)
+              return
+            }
+
+            const { data: profile } = await supabase
+              .from("profiles")
+              .select("*")
+              .eq("id", session.user.id)
+              .single()
+
+            setUser(mapProfileToAuthUser(profile))
+          }
+        )
+        subscription = sub
       }
     }
 
-    getInitialUser()
-
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange(async (event, session) => {
-      if (!session?.user) {
-        setUser(null)
-        return
-      }
-
-      const { data: profile } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", session.user.id)
-        .single()
-
-      setUser(mapProfileToAuthUser(profile))
-    })
+    initialize()
 
     return () => {
       isMounted = false
-      subscription.unsubscribe()
+      subscription?.unsubscribe()
     }
   }, [])
 
@@ -128,15 +140,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     setUser(mapProfileToAuthUser(profile))
     setIsLoading(false)
-    return { success: true }
+    return { success: true, role: profile.role as UserRole }
   }, [])
 
   const register = useCallback(async (data: RegisterData) => {
     setIsLoading(true)
 
+    // Pass all user metadata in signUp so Supabase stores it in auth.users.raw_user_meta_data.
+    // Our handle_new_user trigger reads these fields to populate public.profiles automatically.
     const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
       email: data.email,
       password: data.password,
+      options: {
+        data: {
+          full_name: data.fullName,
+          phone: data.phone,
+          state: data.state,
+          district: data.district,
+          role: data.role,
+        },
+      },
     })
 
     if (signUpError || !signUpData.user) {
@@ -144,7 +167,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return { success: false, error: signUpError?.message ?? "Registration failed" }
     }
 
-    const { error: profileError } = await supabase.from("profiles").insert({
+    // Upsert the profile in case the trigger already ran, or to ensure it's fully populated.
+    const { error: profileError } = await supabase.from("profiles").upsert({
       id: signUpData.user.id,
       full_name: data.fullName,
       email: data.email,
